@@ -15,7 +15,15 @@ port=$(find_port)
 # fixed port here (the project's own settings_demo.env says 3306) would
 # collide the moment two sessions land on the same node at once; a second
 # find_port avoids that the same way `port` above already does for Shiny.
-db_port=$(find_port)
+#
+# export matters here: this file is *sourced* into the framework's own
+# shell, but script.sh (which needs db_port) then runs as a separate forked
+# process, not sourced - the framework pre-declares `export host`/`export
+# port` for its own two conn_params so those two propagate automatically,
+# but has no idea db_port exists. Without an explicit export, script.sh
+# crashes immediately with "db_port: unbound variable" (it runs under
+# `set -u`) - confirmed by hand from a real session's output.log.
+export db_port=$(find_port)
 
 # Unlike the RStudio app this is based on, there's no password/csrf_token
 # here: Shiny Server (the open-source edition this project ships) has no
