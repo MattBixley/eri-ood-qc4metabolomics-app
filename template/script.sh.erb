@@ -119,14 +119,24 @@ run_cron_replacement() {
   local instance="$1" pwd_in_container="$2"
   local cmd
   cmd="$(apptainer exec "instance://${instance}" cat /var/spool/cron/crontabs/root 2>/dev/null \
-    | grep -E '^\*/1 \* \* \* \*' | sed -E 's/^\*\/1 \* \* \* \* //')"
+    | grep -E '^\*/1 \* \* \* \*' | sed -E 's/^\*\/1 \* \* \* \* //')" || true
+  echo "[run_cron_replacement ${instance}] extracted command: [${cmd}]"
   if [ -z "$cmd" ]; then
-    echo "no */1 * * * * cron job found in ${instance}'s baked-in crontab - skipping" >&2
+    echo "[run_cron_replacement ${instance}] no */1 * * * * cron job found in its baked-in crontab - skipping"
     return 0
   fi
   (
+    # This subshell inherits `set -e` from the parent script - without
+    # disabling it, a single failed iteration (e.g. a transient race just
+    # after the instance starts) silently kills the whole loop forever,
+    # with nothing obviously wrong in the log beyond "it just stopped".
+    # Confirmed by hand: an earlier version without this produced a
+    # completely empty log for both qc_process and ms_converter.
+    set +e
     while true; do
+      echo "[run_cron_replacement ${instance}] $(date -Is): running..."
       apptainer exec --env-file "$SETTINGS_ENV" --pwd "$pwd_in_container" "instance://${instance}" bash -c "$cmd"
+      echo "[run_cron_replacement ${instance}] $(date -Is): exit code $?"
       sleep 60
     done
   ) &
