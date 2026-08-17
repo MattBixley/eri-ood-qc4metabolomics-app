@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+
+# QC4Metabolomics: a Shiny-based metabolomics QC dashboard, run via Apptainer
+# instances (mariadb, qc_process, ms_converter, qc_shiny). See the README for
+# the full story on the design choices below; short version:
+#
+# - This session gets its OWN private stack: its own MariaDB database and
+#   its own copy of the demo dataset, staged under this job's own directory
+#   rather than the shared project one. That means concurrent sessions never
+#   race each other over the same files or database - but it also means
+#   each session starts from a fresh, empty QC history rather than showing
+#   the team's shared results. That's a deliberate first-build trade-off,
+#   not an oversight - see the README before using this for anything beyond
+#   a demo/eval.
+#
+# - Nothing here uses `--fakeroot`. No real eRI account has an
+#   /etc/subuid or /etc/subgid range (only template accounts do), so
+#   `apptainer instance start --fakeroot` silently dies moments after
+#   printing "instance started successfully" - confirmed on both a login
+#   node and a compute node, same account. Until that's fixed cluster-wide,
+#   every instance here runs as your own regular user instead, which needs
+#   the workarounds commented at each step below (real bind-mounted
+#   directories instead of --writable-tmpfs's overlay for anything a
+#   container writes; mariadb's own entrypoint bootstrap done by hand;
+#   qc_shiny's /init entrypoint bypassed entirely).
+#
+# - db_backup is intentionally NOT started: it exists to back up the team's
+#   shared production database, which doesn't apply to a private, ephemeral,
+#   per-session sandbox that's gone the moment this session ends.
+
+set -euo pipefail
+
+# Add the missing module path (kept for parity with the RStudio app - this
+# app doesn't currently load any environment modules itself, since the whole
+# stack runs inside Apptainer containers, not the host environment).
+export MODULEPATH="/agr/persist/apps/eri_rocky8/modules/all:$MODULEPATH"
+module purge
+
+APP_SRC="/agr/persist/projects/2026_metabolomics/apps/QC4Metabolomics"
+WORKING_DIR="<%= session.staged_root %>"
+STATE_DIR="${WORKING_DIR}/state"
+
+for sif in mariadb qc_process qc_converter qc_shiny; do
+  [ -f "${APP_SRC}/sif/${sif}.sif" ] || { echo "missing ${APP_SRC}/sif/${sif}.sif" >&2; exit 1; }
+done
+[ -f "${APP_SRC}/settings_demo.env" ] || { echo "missing ${APP_SRC}/settings_demo.env" >&2; exit 1; }
+
+mkdir -p "${STATE_DIR}"/db "${STATE_DIR}"/data "${STATE_DIR}"/mariadb_run \
+         "${STATE_DIR}"/qc_process_run "${STATE_DIR}"/ms_converter_run \
+         "${STATE_DIR}"/qc_shiny_run "${STATE_DIR}"/qc_shiny_logs "${STATE_DIR}"/qc_shiny_lib
+
+# Seed this session's own private data directory from the project's shared
+# demo dataset, so there's something to look at - without ever touching (or
+# racing another concurrent session over) the shared copy.
+if [ -z "$(ls -A "${STATE_DIR}/data" 2>/dev/null)" ]; then
+  echo "Seeding session data directory from the project's demo dataset..."
+  cp -r "${APP_SRC}/demo/data/." "${STATE_DIR}/data/"
+fi
+
+cleanup() {
+  apptainer instance stop --all >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+cd "$APP_SRC"
+
+#
+# mariadb
+#
+echo "Starting mariadb..."
+# Real bind-mounted directories for /var/lib/mysql and /run/mysqld, not
+# --writable-tmpfs's synthetic overlay: apptainer's tmpfs overlay upper
+# layer throws ENODATA for a lot of writes (including the mysqld.sock unix
+# socket bind) when it isn't backed by a real filesystem under a genuine
+# (non-fakeroot) user namespace - a real bind for the same path sidesteps it
+# entirely, since it bypasses the synthetic overlay.
+apptainer instance start --writable-tmpfs --env-file settings_demo.env \
+  --bind "${STATE_DIR}/db":/var/lib/mysql \
+  --bind "${STATE_DIR}/mariadb_run":/run/mysqld \
+  sif/mariadb.sif mariadb
+
+# The stock mariadb Docker entrypoint (which normally bootstraps a fresh
+# data directory and provisions MYSQL_DATABASE/USER/PASSWORD from env vars
+# on first boot) never runs here, since we exec mariadbd directly - so do
+# both steps by hand instead.
+echo "Bootstrapping mariadb data directory..."
+apptainer exec instance://mariadb \
+  mariadb-install-db --datadir=/var/lib/mysql --auth-root-authentication-method=normal \
+  >"${STATE_DIR}/mariadb-install-db.log" 2>&1
+
+# No --user=root: we aren't root (see above), and mariadbd doesn't need to
+# be told to run as a user we can't become anyway.
+apptainer exec instance://mariadb mariadbd --skip_ssl --innodb-flush-method=fsync \
+  >"${STATE_DIR}/mariadb.log" 2>&1 &
+
+echo "Waiting for mariadb to accept connections..."
+waited=0
+# --skip-ssl is needed on the client here too, not just the server, or the
+# client tools refuse to connect ("SSL is required, but the server does not
+# support it").
+until apptainer exec instance://mariadb mariadb-admin --skip-ssl ping --silent 2>/dev/null; do
+  sleep 2
+  waited=$((waited + 2))
+  if [ "$waited" -ge 60 ]; then
+    echo "mariadb did not come up within 60s - last 20 lines of mariadb.log:" >&2
+    tail -n 20 "${STATE_DIR}/mariadb.log" >&2
+    exit 1
+  fi
+done
+echo "mariadb up."
+
+echo "Provisioning this session's own database/user..."
+db="$(grep -E '^MYSQL_DATABASE=' settings_demo.env | tail -n1 | cut -d= -f2-)"
+dbuser="$(grep -E '^MYSQL_USER=' settings_demo.env | tail -n1 | cut -d= -f2-)"
+dbpass="$(grep -E '^MYSQL_PASSWORD=' settings_demo.env | tail -n1 | cut -d= -f2-)"
+# Deleting the anonymous '' user is required: mariadb-install-db's default
+# anonymous user otherwise intercepts localhost auth ahead of the named
+# user and every connection gets rejected.
+apptainer exec instance://mariadb mariadb --skip-ssl -u root <<SQL >"${STATE_DIR}/mariadb-provision.log" 2>&1
+CREATE DATABASE IF NOT EXISTS \`${db}\`;
+DELETE FROM mysql.global_priv WHERE User='';
+CREATE USER IF NOT EXISTS '${dbuser}'@'localhost' IDENTIFIED BY '${dbpass}';
+GRANT ALL PRIVILEGES ON \`${db}\`.* TO '${dbuser}'@'localhost';
+CREATE USER IF NOT EXISTS '${dbuser}'@'%' IDENTIFIED BY '${dbpass}';
+GRANT ALL PRIVILEGES ON \`${db}\`.* TO '${dbuser}'@'%';
+FLUSH PRIVILEGES;
+SQL
+
+#
+# qc_process (cron file-watcher) and ms_converter (raw -> mzML conversion)
+#
+echo "Starting qc_process..."
+apptainer instance start --writable-tmpfs --env-file settings_demo.env \
+  --bind "${STATE_DIR}/data":/data \
+  --bind "${STATE_DIR}/qc_process_run":/run \
+  sif/qc_process.sif qc_process
+apptainer exec --env-file settings_demo.env instance://qc_process /setup/cron_with_env.sh \
+  >"${STATE_DIR}/qc_process.log" 2>&1 &
+
+echo "Starting ms_converter..."
+apptainer instance start --writable-tmpfs --env-file settings_demo.env \
+  --bind "${STATE_DIR}/data":/data \
+  --bind "${STATE_DIR}/ms_converter_run":/run \
+  sif/qc_converter.sif ms_converter
+apptainer exec --env-file settings_demo.env instance://ms_converter /setup/cron_with_env.sh \
+  >"${STATE_DIR}/ms_converter.log" 2>&1 &
+
+#
+# qc_shiny - the actual dashboard OOD connects users to
+#
+echo "Starting qc_shiny..."
+
+# shiny-server refuses to start unless `run_as` names a user it can actually
+# become - without fakeroot the only user we can ever be is ourselves, so
+# rewrite the image's stock 'shiny' to our own username. Also listen on the
+# port OOD found for us (before.sh.erb's `port=$(find_port)`), not the
+# image's hard-coded 3838.
+cat > "${STATE_DIR}/shiny-server.conf" <<CONF
+run_as $(whoami);
+
+app_init_timeout 300;
+app_idle_timeout 300;
+
+server {
+  listen <%= port %>;
+
+  location / {
+    app_dir '/srv/shiny-server/QC4Metabolomics/Shiny_App';
+    log_dir /var/log/shiny-server;
+  }
+}
+CONF
+
+# shiny-server resets the environment for each app's R session, so the app's
+# MYSQL_*/QC4METABOLOMICS_* config has to come in via Renviron.site instead
+# (normally written by the image's own s6 cont-init script, which /init
+# would run - we bypass /init entirely below, so do this ourselves).
+# settings_demo.env is already plain KEY=value, same syntax Renviron.site
+# uses, so this is just a straight concatenation.
+{
+  echo "R_LIBS=\${R_LIBS-'/usr/local/lib/R/site-library:/usr/local/lib/R/library'}"
+  cat settings_demo.env
+} >"${STATE_DIR}/Renviron.site"
+
+apptainer instance start --writable-tmpfs \
+  --bind "${STATE_DIR}/data":/data \
+  --bind "${STATE_DIR}/qc_shiny_run":/run \
+  --bind "${STATE_DIR}/qc_shiny_logs":/var/log/shiny-server \
+  --bind "${STATE_DIR}/qc_shiny_lib":/var/lib/shiny-server \
+  --bind "${STATE_DIR}/shiny-server.conf":/etc/shiny-server/shiny-server.conf \
+  --bind "${STATE_DIR}/Renviron.site":/usr/local/lib/R/etc/Renviron.site \
+  sif/qc_shiny.sif qc_shiny
+
+# Foreground shiny-server directly, bypassing the image's own /init (s6-
+# overlay) entrypoint entirely: /init hard-requires real root to chown
+# things to the 'shiny' user, which we don't have (see above). This is now
+# the job's main process, so the session lives exactly as long as this does
+# - same as how the RStudio app foregrounds `rserver`. Do NOT `exec` this:
+# a plain foreground call lets the `trap cleanup EXIT` above still fire
+# (stopping all instances) once shiny-server exits/is killed; `exec` would
+# replace this shell - and its traps - entirely.
+echo "Starting Shiny Server on port <%= port %>..."
+apptainer exec --env-file settings_demo.env instance://qc_shiny shiny-server

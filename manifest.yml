@@ -1,0 +1,15 @@
+---
+name: QC4Metabolomics
+category: Interactive Apps
+role: batch_connect
+description: |
+  This app will launch [QC4Metabolomics], a Shiny-based continuous
+  quality-control dashboard for metabolomics mass-spec data, run via
+  Apptainer on a cluster node.
+
+  This first build gives each session its own private, self-contained stack
+  (its own MariaDB database, seeded from the project's demo dataset) rather
+  than connecting to one shared team instance - see the README for the
+  reasoning and known caveats before relying on this for production use.
+
+  [QC4Metabolomics]: https://github.com/stanstrup/QC4Metabolomics

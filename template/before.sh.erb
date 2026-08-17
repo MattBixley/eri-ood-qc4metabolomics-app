@@ -1,0 +1,14 @@
+# This script (`before.sh.erb`) is sourced directly into the main Bash script
+# that is run when the batch job starts up. It is called before the `script.sh`
+# is forked off into a separate process.
+
+# Export the module function if it exists
+[[ $(type -t module) == "function" ]] && export -f module
+
+# Find available port to run the Shiny UI on
+port=$(find_port)
+
+# Unlike the RStudio app this is based on, there's no password/csrf_token
+# here: Shiny Server (the open-source edition this project ships) has no
+# built-in authentication to satisfy, so there's nothing to auto-sign-in to -
+# see view.html.erb and the README.

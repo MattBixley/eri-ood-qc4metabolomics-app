@@ -1,0 +1,9 @@
+# Wait for the Shiny UI to start
+echo "Waiting for the QC4Metabolomics Shiny UI to open port ${port}..."
+if wait_until_port_used "${host}:${port}" 600; then
+  echo "Discovered the Shiny UI listening on port ${port}!"
+else
+  echo "Timed out waiting for the Shiny UI to open port ${port}!"
+  clean_up 1
+fi
+sleep 2

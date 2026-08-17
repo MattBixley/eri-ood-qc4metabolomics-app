@@ -1,0 +1,10 @@
+<%#
+  Unlike the RStudio app this is based on, there's no login form here:
+  Shiny Server (the open-source edition this project ships) has no built-in
+  authentication, so there's nothing to sign in to - the only gate is that
+  this URL is only reachable through the requesting user's own
+  authenticated OOD session/proxy in the first place. See the README.
+-%>
+<a class="btn btn-primary" href="/rnode/<%= host %>/<%= port %>/" target="_blank">
+  <i class="fa fa-flask"></i> Connect to QC4Metabolomics
+</a>
