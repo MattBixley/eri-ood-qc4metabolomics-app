@@ -36,6 +36,18 @@
 #   1-minute schedule, so run_cron_replacement() below just extracts that
 #   one command from the image's baked-in crontab and runs it in a loop
 #   instead of using cron at all.
+#
+# - The job does NOT request --exclusive (an earlier version did, which is
+#   also why it always showed the whole node's core count in the OOD
+#   dashboard regardless of what num_cores/num_mem were picked on the form -
+#   removed). num_cores/num_mem/partition (form.yml) are real SLURM cgroup
+#   limits now, and the node is genuinely shared with other jobs. Since
+#   Apptainer instances still bind directly onto the node's real (shared)
+#   network namespace, mariadb can no longer use the fixed port 3306 from
+#   settings_demo.env - a second session on the same node would collide -
+#   so before.sh.erb picks a random db_port the same way it already did for
+#   Shiny, and $SETTINGS_ENV (a session-local copy of settings_demo.env with
+#   MYSQL_PORT overridden) is used everywhere below instead of the original.
 
 set -euo pipefail
 
@@ -58,6 +70,14 @@ mkdir -p "${STATE_DIR}"/db "${STATE_DIR}"/data "${STATE_DIR}"/mariadb_run \
          "${STATE_DIR}"/qc_process_run "${STATE_DIR}"/qc_process_varlog \
          "${STATE_DIR}"/ms_converter_run "${STATE_DIR}"/ms_converter_varlog \
          "${STATE_DIR}"/qc_shiny_run "${STATE_DIR}"/qc_shiny_logs "${STATE_DIR}"/qc_shiny_lib
+
+# A session-local copy of settings_demo.env with MYSQL_PORT overridden to
+# the random db_port before.sh.erb picked (see submit.yml.erb: the job no
+# longer requests --exclusive, so the fixed 3306 in the original file would
+# collide the moment two sessions share a node). Used everywhere below
+# instead of the original.
+SETTINGS_ENV="${STATE_DIR}/settings.env"
+sed -E "s/^MYSQL_PORT=.*/MYSQL_PORT=${db_port}/" "${APP_SRC}/settings_demo.env" >"${SETTINGS_ENV}"
 
 # Seed this session's own private data directory from the project's shared
 # demo dataset, so there's something to look at - without ever touching (or
@@ -106,7 +126,7 @@ run_cron_replacement() {
   fi
   (
     while true; do
-      apptainer exec --env-file settings_demo.env --pwd "$pwd_in_container" "instance://${instance}" bash -c "$cmd"
+      apptainer exec --env-file "$SETTINGS_ENV" --pwd "$pwd_in_container" "instance://${instance}" bash -c "$cmd"
       sleep 60
     done
   ) &
@@ -124,7 +144,7 @@ echo "Starting mariadb..."
 # socket bind) when it isn't backed by a real filesystem under a genuine
 # (non-fakeroot) user namespace - a real bind for the same path sidesteps it
 # entirely, since it bypasses the synthetic overlay.
-apptainer instance start --writable-tmpfs --env-file settings_demo.env \
+apptainer instance start --writable-tmpfs --env-file "$SETTINGS_ENV" \
   --bind "${STATE_DIR}/db":/var/lib/mysql \
   --bind "${STATE_DIR}/mariadb_run":/run/mysqld \
   sif/mariadb.sif mariadb
@@ -139,8 +159,11 @@ apptainer exec instance://mariadb \
   >"${STATE_DIR}/mariadb-install-db.log" 2>&1
 
 # No --user=root: we aren't root (see above), and mariadbd doesn't need to
-# be told to run as a user we can't become anyway.
-apptainer exec instance://mariadb mariadbd --skip_ssl --innodb-flush-method=fsync \
+# be told to run as a user we can't become anyway. --port: bind the random
+# db_port from before.sh.erb instead of the default 3306 - MYSQL_PORT alone
+# (in $SETTINGS_ENV) only tells CLIENT libraries what port to connect to,
+# it doesn't tell the server what to listen on.
+apptainer exec instance://mariadb mariadbd --port="${db_port}" --skip_ssl --innodb-flush-method=fsync \
   >"${STATE_DIR}/mariadb.log" 2>&1 &
 
 echo "Waiting for mariadb to accept connections..."
@@ -160,9 +183,9 @@ done
 echo "mariadb up."
 
 echo "Provisioning this session's own database/user..."
-db="$(grep -E '^MYSQL_DATABASE=' settings_demo.env | tail -n1 | cut -d= -f2-)"
-dbuser="$(grep -E '^MYSQL_USER=' settings_demo.env | tail -n1 | cut -d= -f2-)"
-dbpass="$(grep -E '^MYSQL_PASSWORD=' settings_demo.env | tail -n1 | cut -d= -f2-)"
+db="$(grep -E '^MYSQL_DATABASE=' "$SETTINGS_ENV" | tail -n1 | cut -d= -f2-)"
+dbuser="$(grep -E '^MYSQL_USER=' "$SETTINGS_ENV" | tail -n1 | cut -d= -f2-)"
+dbpass="$(grep -E '^MYSQL_PASSWORD=' "$SETTINGS_ENV" | tail -n1 | cut -d= -f2-)"
 # Deleting the anonymous '' user is required: mariadb-install-db's default
 # anonymous user otherwise intercepts localhost auth ahead of the named
 # user and every connection gets rejected.
@@ -180,7 +203,7 @@ SQL
 # qc_process (cron file-watcher) and ms_converter (raw -> mzML conversion)
 #
 echo "Starting qc_process..."
-apptainer instance start --writable-tmpfs --env-file settings_demo.env \
+apptainer instance start --writable-tmpfs --env-file "$SETTINGS_ENV" \
   --bind "${STATE_DIR}/data":/data \
   --bind "${STATE_DIR}/qc_process_run":/run \
   --bind "${STATE_DIR}/qc_process_varlog":/var/log \
@@ -190,7 +213,7 @@ apptainer instance start --writable-tmpfs --env-file settings_demo.env \
 run_cron_replacement qc_process /srv/shiny-server/QC4Metabolomics >"${STATE_DIR}/qc_process.log" 2>&1
 
 echo "Starting ms_converter..."
-apptainer instance start --writable-tmpfs --env-file settings_demo.env \
+apptainer instance start --writable-tmpfs --env-file "$SETTINGS_ENV" \
   --bind "${STATE_DIR}/data":/data \
   --bind "${STATE_DIR}/ms_converter_run":/run \
   --bind "${STATE_DIR}/ms_converter_varlog":/var/log \
@@ -237,11 +260,12 @@ CONF
 # MYSQL_*/QC4METABOLOMICS_* config has to come in via Renviron.site instead
 # (normally written by the image's own s6 cont-init script, which /init
 # would run - we bypass /init entirely below, so do this ourselves).
-# settings_demo.env is already plain KEY=value, same syntax Renviron.site
-# uses, so this is just a straight concatenation.
+# $SETTINGS_ENV is already plain KEY=value, same syntax Renviron.site uses,
+# so this is just a straight concatenation (and carries the real db_port,
+# unlike the original settings_demo.env's fixed 3306).
 {
   echo "R_LIBS=\${R_LIBS-'/usr/local/lib/R/site-library:/usr/local/lib/R/library'}"
-  cat settings_demo.env
+  cat "$SETTINGS_ENV"
 } >"${STATE_DIR}/Renviron.site"
 
 apptainer instance start --writable-tmpfs \
@@ -263,7 +287,7 @@ apptainer instance start --writable-tmpfs \
 # an --env-file issue (a plain `apptainer exec --env-file` call, unlike
 # shiny-server spawning an app session, does see these vars directly).
 echo "Initializing QC4Metabolomics database schema..."
-apptainer exec --env-file settings_demo.env instance://qc_shiny \
+apptainer exec --env-file "$SETTINGS_ENV" instance://qc_shiny \
   bash -c 'cd /srv/shiny-server/QC4Metabolomics && Rscript setup/init_db.R' \
   >"${STATE_DIR}/init_db.log" 2>&1
 
@@ -276,4 +300,4 @@ apptainer exec --env-file settings_demo.env instance://qc_shiny \
 # (stopping all instances) once shiny-server exits/is killed; `exec` would
 # replace this shell - and its traps - entirely.
 echo "Starting Shiny Server on port ${port}..."
-apptainer exec --env-file settings_demo.env instance://qc_shiny shiny-server
+apptainer exec --env-file "$SETTINGS_ENV" instance://qc_shiny shiny-server

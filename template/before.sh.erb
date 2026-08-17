@@ -8,6 +8,15 @@
 # Find available port to run the Shiny UI on
 port=$(find_port)
 
+# A second, separate port for mariadb. The job no longer requests
+# --exclusive (see submit.yml.erb), so this node's "compute" cores/mem are
+# shared with other jobs - but Apptainer instances still bind directly onto
+# the node's real (shared) network namespace, not a private per-job one. A
+# fixed port here (the project's own settings_demo.env says 3306) would
+# collide the moment two sessions land on the same node at once; a second
+# find_port avoids that the same way `port` above already does for Shiny.
+db_port=$(find_port)
+
 # Unlike the RStudio app this is based on, there's no password/csrf_token
 # here: Shiny Server (the open-source edition this project ships) has no
 # built-in authentication to satisfy, so there's nothing to auto-sign-in to -

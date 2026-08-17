@@ -27,11 +27,16 @@ batch_connect:
 script:
   job_name: "qc4metabolomics"
   native:
-    # num_cores/num_mem/partition all come from the form (form.yml).
-    # --exclusive still claims the whole node regardless of num_cores/
-    # num_mem (needed so the stack's shared host-network namespace has no
-    # port clashes with another job) - so those two only affect what SLURM
-    # records as requested for the job, not what's actually usable.
+    # num_cores/num_mem/partition all come from the form (form.yml) and are
+    # real limits now: no --exclusive, so this is a normal shared-node
+    # SLURM allocation and num_cores/num_mem are what SLURM's cgroups
+    # actually confine the job to, not just what gets recorded/requested.
+    # (An earlier version of this app used --exclusive, which made SLURM/OOD
+    # report the whole node's cores regardless of what was selected here -
+    # removed. Since the job now shares the node with others, template/
+    # before.sh.erb picks a second random port for mariadb the same way it
+    # already does for Shiny, instead of the fixed 3306 in settings_demo.env
+    # - see script.sh.erb for why that matters once --exclusive is gone.)
     # `partition` is a plain select, not a bc_queue smart attribute, so it's
     # the single, explicit source of truth for which partition gets used -
     # no separate queue->partition mapping to redundantly (or worse,
@@ -39,5 +44,4 @@ script:
     - <%= "--nodes=1" %>
     - <%= "--cpus-per-task=#{num_cores}" %>
     - <%= "--mem=#{num_mem}gb" %>
-    - "--exclusive"
     - <%= "--partition=#{partition}" %>

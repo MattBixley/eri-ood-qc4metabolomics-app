@@ -51,11 +51,13 @@ attributes:
       - ["interactive", "interactive"]
       - ["hugemem", "hugemem"]
 
-  # @note The job always requests a whole node (`--exclusive` in
-  #   submit.yml.erb, needed so the stack's shared host-network namespace
-  #   has no port clashes with another job) - so these values don't limit
-  #   how much CPU/memory the session can actually use, only what SLURM
-  #   records as requested/accounted for the job. Bounds below match/exceed
+  # @note These are real limits, enforced by SLURM's cgroups: the job does
+  #   NOT request --exclusive (an earlier version of this app did, which is
+  #   also why it always showed the whole node's core count regardless of
+  #   what was picked here - removed). Since the node is now shared with
+  #   other jobs, template/before.sh.erb picks a random port for mariadb
+  #   the same way it already did for Shiny, instead of the fixed 3306 in
+  #   settings_demo.env - see script.sh.erb. Bounds below match/exceed
   #   run_qc.sh's own request (8 cores, 14GB); adjust the max if this
   #   cluster's "compute" nodes are smaller/larger than that.
   num_cores:

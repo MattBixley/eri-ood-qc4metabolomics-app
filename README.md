@@ -11,7 +11,8 @@ before relying on it for anything beyond a demo/eval.
 
 ## What this app does
 
-Submitting the form starts a whole-node (`--exclusive`) SLURM job that:
+Submitting the form starts a normal (shared-node) SLURM job, sized by the
+`partition`/`num_cores`/`num_mem` fields you pick, that:
 
 1. Starts `mariadb`, `qc_process` (cron file-watcher), `ms_converter`
    (raw -> mzML conversion) and `qc_shiny` (the Shiny UI) as Apptainer
@@ -146,6 +147,30 @@ cron at all. Two things this needed, both confirmed by hand:
   image) instead of quietly activating the image's already-fully-installed
   one.
 
+## Fixed: the form always showed "1 node | 256 cores" regardless of selection
+
+An earlier version of this app requested `--exclusive` in `submit.yml.erb`
+(a whole node, no matter what `num_cores`/`num_mem` were set to) - which is
+also why SLURM/OOD always reported the whole node's actual core count in the
+session card, ignoring the form's selection entirely. `--exclusive` is gone;
+`num_cores`/`num_mem`/`partition` (`form.yml`) are now real SLURM cgroup
+limits, and the node is genuinely shared with other jobs.
+
+That reintroduces the reason `--exclusive` was there in the first place:
+Apptainer instances bind directly onto the node's real (shared) network
+namespace, not a private per-job one, so a *fixed* port collides the moment
+two sessions land on the same node at once. Shiny's port was already
+dynamic (`before.sh.erb`'s `port=$(find_port)`) - mariadb's wasn't
+(`settings_demo.env` hard-codes `MYSQL_PORT=3306`). `before.sh.erb` now
+picks a second random `db_port` the same way, and `script.sh.erb` builds
+`$SETTINGS_ENV` - a session-local copy of `settings_demo.env` with
+`MYSQL_PORT` overridden - used everywhere instead of the original.
+`mariadbd` itself needs an explicit `--port="${db_port}"` too: `MYSQL_PORT`
+only tells *client* libraries what port to connect to, it doesn't tell the
+server what to listen on. Confirmed end-to-end by hand (mariadb bound to a
+random port via TCP, `init_db.R` and the Shiny UI both connecting through
+`$SETTINGS_ENV`/`Renviron.site`, HTTP 200) before this landed.
+
 ## No login on the Shiny UI
 
 Unlike the RStudio app (which auto-signs you in via a per-session password
@@ -163,13 +188,11 @@ session/proxy.
   actual OOD form submission, job templating, and reverse-proxy/websocket
   behavior for Shiny's websocket-based reactivity have not been exercised
   end-to-end through a live OnDemand instance.
-- **Partition/cores/mem are now user-selectable** (`form.yml`'s `partition`
-  select and `num_cores`/`num_mem` number fields) - options were taken from
-  this cluster's actual `sinfo`/`scontrol show partition` output
-  (2026-08-18: `compute`, `interactive`, `hugemem` - `gpu`/`vgpu` deliberately
-  excluded, this app has no GPU workload). Re-check that list if partitions
-  are ever renamed/added/removed. `--exclusive` still claims the whole node
-  regardless of the cores/mem picked (see `form.yml`'s own comment).
+- **Partition options** (`form.yml`'s `partition` select: `compute`,
+  `interactive`, `hugemem`) were taken from this cluster's actual
+  `sinfo`/`scontrol show partition` output on 2026-08-18 (`gpu`/`vgpu`
+  deliberately excluded - this app has no GPU workload). Re-check that list
+  if partitions are ever renamed/added/removed.
   - No custom `icon.png` yet - falls back to OOD's default app icon.
 - `db_backup` got less scrutiny than the other four containers even in the
   original hand-validation this is based on (though it isn't started here at
