@@ -93,6 +93,45 @@ See also the sibling `q/QC4Metabolomics/` module in
 [eri-easyconfigs](https://github.com/nesi/eri-easyconfigs), which documents
 the same findings for a standalone (non-OOD) module wrapper.
 
+## Schema initialization (`setup/init_db.R`)
+
+`CREATE DATABASE` alone gives you an *empty* database - the app's own tables
+(one set per enabled module, defined by `Modules/*/init_db_create.sql`) are
+created by the project's `setup/init_db.R`, which `script.sh.erb` now runs
+once via `apptainer exec` into the `qc_shiny` instance right after it starts
+(that image is what has R, the `MetabolomiQCsR` package, and the `Modules/`
+SQL files - `mariadb`'s image doesn't). Skipping this step doesn't fail the
+job or even fail `wait_until_port_used` - shiny-server comes up and answers
+HTTP requests just fine - but every visit to the app crashes with:
+
+```
+Error : No tables in the DB. Probably not done initializing.
+```
+
+which reads as "doesn't connect" from the OOD dashboard even though the
+job, the containers, and the Shiny UI's HTTP listener are all fine. If this
+resurfaces, check `<session dir>/state/init_db.log` first.
+
+## Known issue: qc_process/ms_converter's cron doesn't actually run
+
+Both containers' `/setup/cron_with_env.sh` fail identically:
+
+```
+Starting cron
+seteuid: Invalid argument
+```
+
+cron tries to drop from its own process to the crontab-owning user via
+`seteuid()`, which fails under a rootless (non-fakeroot) user namespace even
+when the target is nominally "yourself" - the same underlying limitation as
+everything else in this README, just hitting a different syscall. Net
+effect: the session's own file-watching/raw-to-mzML-conversion pipeline does
+not run. This doesn't block the dashboard itself (you'll see the seeded demo
+`.mzML` files this session copied in, since those are pre-converted), but
+dropping any new `.raw` files into the session's data directory won't
+actually get picked up and converted. Not yet fixed - flagging it here
+rather than silently leaving it looking like it works.
+
 ## No login on the Shiny UI
 
 Unlike the RStudio app (which auto-signs you in via a per-session password

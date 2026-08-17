@@ -9,8 +9,9 @@
 cluster: "slurm"
 
 form:
-  - bc_queue
   - bc_num_hours
+  - num_cores
+  - num_mem
 description: Request a QC4Metabolomics session
 submit: submit.yml.erb
 title: QC4Metabolomics
@@ -19,28 +20,46 @@ title: QC4Metabolomics
 # Define attribute values that aren't meant to be modified by the user within
 # the Dashboard form.
 #
-# @note Unlike the eri-ood-rstudio-server-app this is based on, cores/memory
-#   are NOT exposed as adjustable fields here: QC4Metabolomics's own
-#   run_qc.sh always requests a whole node (`--exclusive`), so a bigger
-#   core/mem pick from the user wouldn't actually change anything - see
-#   submit.yml.erb, which hard-codes the same --cpus-per-task=8 --mem=14gb
-#   --exclusive that run_qc.sh uses.
+# @note There's no `bc_queue` widget here (unlike the reference RStudio app):
+#   the job always needs the "compute" partition (matching run_qc.sh), and
+#   letting `bc_queue`'s queue->partition mapping AND an explicit
+#   `--partition=compute` native arg both apply at once (which is what the
+#   first build here did) is exactly the kind of double-mapping that's easy
+#   to get subtly wrong. submit.yml.erb now hard-codes
+#   `--partition=compute` directly as the single source of truth for which
+#   partition gets used - check that still matches this cluster's actual
+#   /etc/ood/config/clusters.d/slurm.yml if the "compute" partition name
+#   ever changes.
 attributes:
-  # @note "interactive" is what the reference eri-ood-rstudio-server-app
-  #   uses and is known to work on this cluster's OOD config; submit.yml.erb
-  #   also hard-codes `--partition=compute` (matching run_qc.sh) as a native
-  #   arg, which may be redundant with (or need reconciling against)
-  #   whatever partition "interactive" maps to in
-  #   /etc/ood/config/clusters.d/slurm.yml - check that on deploy.
-  bc_queue:
-    value: interactive
-
   bc_num_hours:
     max: 8
     min: 1
     step: 1
     value: 1
     widget: number_field
+
+  # @note The job always requests a whole node (`--exclusive` in
+  #   submit.yml.erb, needed so the stack's shared host-network namespace
+  #   has no port clashes with another job) - so these values don't limit
+  #   how much CPU/memory the session can actually use, only what SLURM
+  #   records as requested/accounted for the job. Bounds below match/exceed
+  #   run_qc.sh's own request (8 cores, 14GB); adjust the max if this
+  #   cluster's "compute" nodes are smaller/larger than that.
+  num_cores:
+    label: "Number of cores"
+    widget: number_field
+    min: 4
+    max: 32
+    step: 1
+    value: 8
+
+  num_mem:
+    label: "Memory (GB)"
+    widget: number_field
+    min: 8
+    max: 64
+    step: 1
+    value: 14
 
 
 # All of the attributes that make up the Dashboard form (in respective order),

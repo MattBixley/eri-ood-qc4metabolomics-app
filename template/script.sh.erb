@@ -201,6 +201,20 @@ apptainer instance start --writable-tmpfs \
   --bind "${STATE_DIR}/Renviron.site":/usr/local/lib/R/etc/Renviron.site \
   sif/qc_shiny.sif qc_shiny
 
+# Create the app's own schema (tables, per enabled Modules/*/init_db_create.sql)
+# in this session's fresh database. CREATE DATABASE above only gives us an
+# EMPTY database - the project's own setup/init_db.R (which lives inside the
+# qc_shiny image, alongside the app itself, and connects using the exact same
+# MYSQL_* config) is what actually creates the tables the app expects. Skip
+# this and the Shiny app connects fine but immediately errors on every visit
+# with "No tables in the DB. Probably not done initializing." - this is NOT
+# an --env-file issue (a plain `apptainer exec --env-file` call, unlike
+# shiny-server spawning an app session, does see these vars directly).
+echo "Initializing QC4Metabolomics database schema..."
+apptainer exec --env-file settings_demo.env instance://qc_shiny \
+  bash -c 'cd /srv/shiny-server/QC4Metabolomics && Rscript setup/init_db.R' \
+  >"${STATE_DIR}/init_db.log" 2>&1
+
 # Foreground shiny-server directly, bypassing the image's own /init (s6-
 # overlay) entrypoint entirely: /init hard-requires real root to chown
 # things to the 'shiny' user, which we don't have (see above). This is now
