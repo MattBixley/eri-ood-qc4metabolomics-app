@@ -112,25 +112,39 @@ which reads as "doesn't connect" from the OOD dashboard even though the
 job, the containers, and the Shiny UI's HTTP listener are all fine. If this
 resurfaces, check `<session dir>/state/init_db.log` first.
 
-## Known issue: qc_process/ms_converter's cron doesn't actually run
+## Fixed: qc_process/ms_converter's cron didn't actually run
 
-Both containers' `/setup/cron_with_env.sh` fail identically:
+Both containers' own `/setup/cron_with_env.sh` entrypoint starts
+Debian/Ubuntu's `cron`, which failed immediately:
 
 ```
 Starting cron
 seteuid: Invalid argument
 ```
 
-cron tries to drop from its own process to the crontab-owning user via
-`seteuid()`, which fails under a rootless (non-fakeroot) user namespace even
-when the target is nominally "yourself" - the same underlying limitation as
-everything else in this README, just hitting a different syscall. Net
-effect: the session's own file-watching/raw-to-mzML-conversion pipeline does
-not run. This doesn't block the dashboard itself (you'll see the seeded demo
-`.mzML` files this session copied in, since those are pre-converted), but
-dropping any new `.raw` files into the session's data directory won't
-actually get picked up and converted. Not yet fixed - flagging it here
-rather than silently leaving it looking like it works.
+Confirmed by hand this is cron's own startup behavior under a rootless user
+namespace - it happens even with an *empty* crontab, so it's not about a
+specific job's owning user (reinstalling the baked-in `root` crontab under
+your own user doesn't help). Since each container only ever has ONE job on a
+fixed 1-minute schedule, `script.sh.erb`'s `run_cron_replacement()` now just
+extracts that one command from the image's baked-in
+`/var/spool/cron/crontabs/root` and runs it in a plain loop instead of using
+cron at all. Two things this needed, both confirmed by hand:
+
+- a real bind-mounted `/var/log` (same ENODATA-on-`--writable-tmpfs`-overlay
+  story as everywhere else in this README - the job's own `>> /var/log/*.log`
+  redirect needs a real filesystem underneath).
+- an explicit `--pwd` into the image's own app directory
+  (`/srv/shiny-server/QC4Metabolomics` for `qc_process`, `/converter_scripts`
+  for `ms_converter`). Without it, `apptainer exec` mirrors the *calling host
+  process's* cwd inside the container - and since this script's own cwd is
+  `$APP_SRC` (the project's GPFS checkout, which apptainer on this cluster
+  transparently binds into every container), landing there by accident makes
+  R's implicit `.Rprofile`-sourcing at startup try to bootstrap and download
+  an entire `renv` environment from scratch (that GPFS checkout has its own
+  *never-built* `renv.lock`/`.Rprofile`, distinct from the one baked into the
+  image) instead of quietly activating the image's already-fully-installed
+  one.
 
 ## No login on the Shiny UI
 
@@ -149,14 +163,14 @@ session/proxy.
   actual OOD form submission, job templating, and reverse-proxy/websocket
   behavior for Shiny's websocket-based reactivity have not been exercised
   end-to-end through a live OnDemand instance.
-- **`bc_queue: interactive`** in `form.yml` is copied from the known-working
-  RStudio app; `submit.yml.erb` additionally hard-codes
-  `--partition=compute` (matching `run_qc.sh`) as a native SLURM arg, which
-  may double up with (or need reconciling against) whatever partition
-  `interactive` maps to in this cluster's `/etc/ood/config/clusters.d/slurm.yml`
-  - check that on deploy.
+- **Partition/cores/mem are now user-selectable** (`form.yml`'s `partition`
+  select and `num_cores`/`num_mem` number fields) - options were taken from
+  this cluster's actual `sinfo`/`scontrol show partition` output
+  (2026-08-18: `compute`, `interactive`, `hugemem` - `gpu`/`vgpu` deliberately
+  excluded, this app has no GPU workload). Re-check that list if partitions
+  are ever renamed/added/removed. `--exclusive` still claims the whole node
+  regardless of the cores/mem picked (see `form.yml`'s own comment).
   - No custom `icon.png` yet - falls back to OOD's default app icon.
-- `qc_process`/`ms_converter`/`db_backup` got less scrutiny than
-  `mariadb`/`qc_shiny` even in the original hand-validation this is based on
-  - if file conversion/processing misbehaves in a session, check their logs
-    under `<session dir>/state/*.log`.
+- `db_backup` got less scrutiny than the other four containers even in the
+  original hand-validation this is based on (though it isn't started here at
+  all - see above).

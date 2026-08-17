@@ -10,6 +10,7 @@ cluster: "slurm"
 
 form:
   - bc_num_hours
+  - partition
   - num_cores
   - num_mem
 description: Request a QC4Metabolomics session
@@ -21,15 +22,13 @@ title: QC4Metabolomics
 # the Dashboard form.
 #
 # @note There's no `bc_queue` widget here (unlike the reference RStudio app):
-#   the job always needs the "compute" partition (matching run_qc.sh), and
-#   letting `bc_queue`'s queue->partition mapping AND an explicit
-#   `--partition=compute` native arg both apply at once (which is what the
-#   first build here did) is exactly the kind of double-mapping that's easy
-#   to get subtly wrong. submit.yml.erb now hard-codes
-#   `--partition=compute` directly as the single source of truth for which
-#   partition gets used - check that still matches this cluster's actual
-#   /etc/ood/config/clusters.d/slurm.yml if the "compute" partition name
-#   ever changes.
+#   `bc_queue`'s queue->partition mapping and an explicit `--partition=...`
+#   native arg both applying at once (which is what the first build here
+#   did, redundantly landing on the same partition only by coincidence) is
+#   exactly the kind of double-mapping that's easy to get subtly wrong.
+#   `partition` below (a plain select, not a bc_* smart attribute) is now
+#   the single, explicit source of truth for which partition gets used - see
+#   submit.yml.erb.
 attributes:
   bc_num_hours:
     max: 8
@@ -37,6 +36,20 @@ attributes:
     step: 1
     value: 1
     widget: number_field
+
+  # @note Options taken from `sinfo`/`scontrol show partition` on this
+  #   cluster (2026-08-18): compute (6 nodes, 14 day max), interactive
+  #   (3 nodes, 60 day max), hugemem (2 nodes, 14 day max). gpu/vgpu are
+  #   deliberately left out - this app has no GPU workload. "compute"
+  #   matches run_qc.sh and stays the default; re-check this list if
+  #   partitions are ever renamed/added/removed on this cluster.
+  partition:
+    label: "Partition"
+    widget: select
+    options:
+      - ["compute", "compute"]
+      - ["interactive", "interactive"]
+      - ["hugemem", "hugemem"]
 
   # @note The job always requests a whole node (`--exclusive` in
   #   submit.yml.erb, needed so the stack's shared host-network namespace

@@ -27,6 +27,15 @@
 # - db_backup is intentionally NOT started: it exists to back up the team's
 #   shared production database, which doesn't apply to a private, ephemeral,
 #   per-session sandbox that's gone the moment this session ends.
+#
+# - qc_process/ms_converter don't use their own /setup/cron_with_env.sh
+#   entrypoint (which starts Debian/Ubuntu's `cron`): that fails immediately
+#   with "seteuid: Invalid argument" here, cron's own startup behavior under
+#   a rootless user namespace, unrelated to which user any specific job
+#   would run as. Both containers only ever have ONE job on a fixed
+#   1-minute schedule, so run_cron_replacement() below just extracts that
+#   one command from the image's baked-in crontab and runs it in a loop
+#   instead of using cron at all.
 
 set -euo pipefail
 
@@ -46,7 +55,8 @@ done
 [ -f "${APP_SRC}/settings_demo.env" ] || { echo "missing ${APP_SRC}/settings_demo.env" >&2; exit 1; }
 
 mkdir -p "${STATE_DIR}"/db "${STATE_DIR}"/data "${STATE_DIR}"/mariadb_run \
-         "${STATE_DIR}"/qc_process_run "${STATE_DIR}"/ms_converter_run \
+         "${STATE_DIR}"/qc_process_run "${STATE_DIR}"/qc_process_varlog \
+         "${STATE_DIR}"/ms_converter_run "${STATE_DIR}"/ms_converter_varlog \
          "${STATE_DIR}"/qc_shiny_run "${STATE_DIR}"/qc_shiny_logs "${STATE_DIR}"/qc_shiny_lib
 
 # Seed this session's own private data directory from the project's shared
@@ -61,6 +71,46 @@ cleanup() {
   apptainer instance stop --all >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+# qc_process/ms_converter's own entrypoint (/setup/cron_with_env.sh) starts
+# Debian/Ubuntu's `cron`, which fails immediately with "seteuid: Invalid
+# argument" under this rootless setup - confirmed by hand this happens in
+# cron's own startup, even with an empty crontab, so reinstalling the
+# baked-in crontab under our own user doesn't help (it's not about a
+# specific job's owning user at all). Both containers only ever have ONE
+# job on a fixed 1-minute schedule (confirmed: `*/1 * * * * <command>` in
+# each image's /var/spool/cron/crontabs/root) - so rather than fighting
+# cron's internals inside a vendored image, just extract that one command
+# and run it in a plain loop instead of using cron at all.
+#
+# $2 (pwd) matters more than it looks: `apptainer exec` mirrors the CALLING
+# host process's cwd inside the container when that path also happens to
+# exist there - and on this cluster it does, since apptainer transparently
+# binds the real /agr tree into every container. Since $APP_SRC (this
+# script's own cwd) is the project's GPFS checkout - which has its own
+# never-built .Rprofile/renv/renv.lock, just like every git clone of this
+# project would - landing there by accident makes R's implicit startup
+# .Rprofile sourcing try to bootstrap and download a whole renv environment
+# from scratch (confirmed by hand) instead of quietly activating the
+# already-fully-installed one baked into the image at
+# /srv/shiny-server/QC4Metabolomics. Passing an explicit --pwd avoids ever
+# leaving this to chance.
+run_cron_replacement() {
+  local instance="$1" pwd_in_container="$2"
+  local cmd
+  cmd="$(apptainer exec "instance://${instance}" cat /var/spool/cron/crontabs/root 2>/dev/null \
+    | grep -E '^\*/1 \* \* \* \*' | sed -E 's/^\*\/1 \* \* \* \* //')"
+  if [ -z "$cmd" ]; then
+    echo "no */1 * * * * cron job found in ${instance}'s baked-in crontab - skipping" >&2
+    return 0
+  fi
+  (
+    while true; do
+      apptainer exec --env-file settings_demo.env --pwd "$pwd_in_container" "instance://${instance}" bash -c "$cmd"
+      sleep 60
+    done
+  ) &
+}
 
 cd "$APP_SRC"
 
@@ -133,17 +183,19 @@ echo "Starting qc_process..."
 apptainer instance start --writable-tmpfs --env-file settings_demo.env \
   --bind "${STATE_DIR}/data":/data \
   --bind "${STATE_DIR}/qc_process_run":/run \
+  --bind "${STATE_DIR}/qc_process_varlog":/var/log \
   sif/qc_process.sif qc_process
-apptainer exec --env-file settings_demo.env instance://qc_process /setup/cron_with_env.sh \
-  >"${STATE_DIR}/qc_process.log" 2>&1 &
+# --pwd: see run_cron_replacement's own comment above - this is where the
+# image's own already-installed renv/.Rprofile actually live.
+run_cron_replacement qc_process /srv/shiny-server/QC4Metabolomics >"${STATE_DIR}/qc_process.log" 2>&1
 
 echo "Starting ms_converter..."
 apptainer instance start --writable-tmpfs --env-file settings_demo.env \
   --bind "${STATE_DIR}/data":/data \
   --bind "${STATE_DIR}/ms_converter_run":/run \
+  --bind "${STATE_DIR}/ms_converter_varlog":/var/log \
   sif/qc_converter.sif ms_converter
-apptainer exec --env-file settings_demo.env instance://ms_converter /setup/cron_with_env.sh \
-  >"${STATE_DIR}/ms_converter.log" 2>&1 &
+run_cron_replacement ms_converter /converter_scripts >"${STATE_DIR}/ms_converter.log" 2>&1
 
 #
 # qc_shiny - the actual dashboard OOD connects users to

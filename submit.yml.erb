@@ -27,16 +27,17 @@ batch_connect:
 script:
   job_name: "qc4metabolomics"
   native:
-    # num_cores/num_mem come from the form (form.yml) - --exclusive still
-    # claims the whole node regardless (needed so the stack's shared
-    # host-network namespace has no port clashes with another job), so these
-    # only affect what SLURM records as requested for the job, not what's
-    # actually usable. --partition=compute is the single, explicit source of
-    # truth for which partition gets used (matching run_qc.sh) - there's no
-    # bc_queue here to (redundantly, or worse, conflictingly) map to a
-    # partition too.
+    # num_cores/num_mem/partition all come from the form (form.yml).
+    # --exclusive still claims the whole node regardless of num_cores/
+    # num_mem (needed so the stack's shared host-network namespace has no
+    # port clashes with another job) - so those two only affect what SLURM
+    # records as requested for the job, not what's actually usable.
+    # `partition` is a plain select, not a bc_queue smart attribute, so it's
+    # the single, explicit source of truth for which partition gets used -
+    # no separate queue->partition mapping to redundantly (or worse,
+    # conflictingly) also apply.
     - <%= "--nodes=1" %>
     - <%= "--cpus-per-task=#{num_cores}" %>
     - <%= "--mem=#{num_mem}gb" %>
     - "--exclusive"
-    - "--partition=compute"
+    - <%= "--partition=#{partition}" %>
