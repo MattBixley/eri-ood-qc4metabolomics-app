@@ -26,6 +26,77 @@ intentionally **not** started - it backs up the team's shared production
 database, which doesn't apply to a private, per-session sandbox that goes
 away when the session ends.
 
+## Using the dashboard
+
+The tabs aren't all equally important - there's a clear path for a
+first-time visit (per the upstream project's own docs,
+[stanstrup.github.io/QC4Metabolomics](http://stanstrup.github.io/QC4Metabolomics/)):
+
+1. **Contaminants** - start here. Shows a plot of the most frequently
+   detected contaminants across whatever files have been processed so far,
+   with a "minimum intensity" threshold slider. It auto-refreshes about
+   every minute as new files come in, so it's the quickest way to check the
+   pipeline is actually doing something.
+2. **Track Compounds** (`TrackCmp`) - two sub-tabs:
+   - *Compound Settings*: define specific analytes to watch over time (name,
+     instrument, ionization mode, m/z, retention time). Nothing shows up in
+     *Compound Stats* until at least one compound is defined here - seeing
+     `No compounds defined. Quitting.` in `state/qc_process.log` is expected
+     on a fresh session, not an error.
+   - *Compound Stats*: the tracked values for whatever you configured, once
+     data has come in.
+3. **Warning Rules** (`Warner`) - threshold rules (e.g. "m/z deviation >
+   X") that trigger an email alert when a new file violates them.
+
+The rest (`Files`, `FileInfo`, `Productivity`, `Log`, `FileSchedule`,
+`Debug`) are more operational/supporting views - file status, parsed
+filename metadata, throughput, and internal logs.
+
+## Importing your own data
+
+This is a filesystem workflow, not a Shiny upload button - confirmed from
+the project's own ["Moving raw files
+automatically"](http://stanstrup.github.io/QC4Metabolomics/articles/file_move.html)
+doc: the pipeline is driven by two plain text files, `raw_filelist.txt` and
+`mzML_filelist.txt`, that `ms_converter` and `qc_process` each poll once a
+minute (`script.sh.erb`'s `run_cron_replacement()` - see below).
+
+Your session's own private data directory is:
+
+```
+<session output dir>/state/data/
+```
+
+e.g. `~/ondemand/data/sys/dashboard/batch_connect/dev/qc4metabolomics/output/<session-id>/state/data/`
+(find `<session-id>` from the OOD dashboard's session card, or `ls -t` that
+`output/` directory for the newest one).
+
+To add your own files, from a terminal while the session is running (OOD's
+Shell app, or SSH to whichever compute node the session landed on - shown
+on the session card):
+
+- **Already `.mzML`**: copy the file into `state/data/`, then append its
+  full path as a new line to `state/data/mzML_filelist.txt` - `qc_process`
+  picks it up within a minute.
+- **Raw instrument files** (e.g. `.raw`): copy the folder into
+  `state/data/`, append its path to `state/data/raw_filelist.txt` instead -
+  `ms_converter` converts it to `.mzML` first, then writes the result into
+  `mzML_filelist.txt` for you.
+
+Filenames need to follow the mask this deployment's `settings_demo.env`
+expects: `project_date_instrument_batchseq_mode_sampleid` (e.g. the seeded
+demo file `Mcourse_20230509_Sold_031_pos_5A-0424.mzML`) - that's how the
+dashboard extracts instrument/date/mode for filtering and the Contaminants/
+TrackCmp tabs.
+
+To confirm processing actually happened, check
+`state/qc_process.log`/`state/qc_process_varlog/QC_cron.log` (or the
+`ms_converter` equivalents) after a minute or two - a real run looks like
+several `Modules/*/schedule.R` scripts running in sequence with only
+benign R deprecation warnings, ending in the Contaminants module printing
+`"Starting next batch of files"`. If it errors instead, that log is where
+to look first.
+
 ## Design choice: private per-session stack, not one shared team instance
 
 QC4Metabolomics is really meant as a shared, continuously-running team QC
@@ -147,6 +218,16 @@ cron at all. Two things this needed, both confirmed by hand:
   image) instead of quietly activating the image's already-fully-installed
   one.
 
+A follow-up real session initially showed both `qc_process.log` and
+`ms_converter.log` completely empty (not even an error) - `run_cron_replacement()`
+got hardened with `set +e` inside the loop (a single failed iteration was
+silently killing it forever) and unconditional diagnostic logging of the
+extracted command. Confirmed in a subsequent real session: `qc_process` ran
+all five `Modules/*/schedule.R` scripts successfully against the seeded
+demo data (a few minutes end-to-end, since Contaminants loads the full
+xcms/Bioconductor stack), and `ms_converter` polls and exits cleanly every
+minute (nothing to convert - the demo dataset is already `.mzML`).
+
 ## Fixed: the form always showed "1 node | 256 cores" regardless of selection
 
 An earlier version of this app requested `--exclusive` in `submit.yml.erb`
@@ -182,12 +263,14 @@ session/proxy.
 
 ## Known caveats (first build - check these before relying on this)
 
-- **Not yet tested through a real OOD web front-end.** Everything in
-  `template/script.sh.erb` was validated by hand, piece by piece, outside of
-  OOD (see the eri-easyconfigs conversation this was built from) - but the
-  actual OOD form submission, job templating, and reverse-proxy/websocket
-  behavior for Shiny's websocket-based reactivity have not been exercised
-  end-to-end through a live OnDemand instance.
+- **Confirmed working through a real OOD session** (2026-08-18): form
+  submission, job templating, the reverse proxy, and Shiny's websocket-based
+  reactivity all work end-to-end - `qc_process` successfully ran all five
+  `Modules/*/schedule.R` scripts (Files, FileInfo, FileSchedule,
+  Contaminants, TrackCmp) against the seeded demo data, and `ms_converter`
+  polls cleanly every minute. Earlier revisions of this README said this
+  was untested; it no longer is, though it's still worth treating as a
+  first build rather than production-hardened.
 - **Partition options** (`form.yml`'s `partition` select: `compute`,
   `interactive`, `hugemem`) were taken from this cluster's actual
   `sinfo`/`scontrol show partition` output on 2026-08-18 (`gpu`/`vgpu`
